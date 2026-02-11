@@ -92,5 +92,55 @@ def plot_accuracy_by_duplicates():
     plt.close(fig)
 
 
+def plot_logprob_scatter():
+    """Scatter: standard vs perturbed log-prob of correct answer, grid by dup level."""
+    df = pd.read_parquet(RESULTS_DIR / "per_example_signals.parquet")
+
+    # Derive log-prob of the correct option for each model
+    for model in ["standard", "perturbed"]:
+        df[f"logprob_correct_{model}"] = np.where(
+            df["answer"] == 1,
+            df[f"logprob_option1_{model}"],
+            df[f"logprob_option2_{model}"],
+        )
+
+    df = df[df["format"] == "infill"]
+
+    dup_levels = sorted(df["duplicates"].unique())  # [0, 1, 4, 16, 64, 256]
+    fig, axes = plt.subplots(2, 3, figsize=(14, 9), sharex=True, sharey=True)
+
+    # Shared axis limits
+    all_vals = pd.concat([df["logprob_correct_standard"], df["logprob_correct_perturbed"]])
+    lo, hi = all_vals.quantile(0.001), all_vals.quantile(0.999)
+    pad = (hi - lo) * 0.05
+
+    for ax, dup in zip(axes.flat, dup_levels):
+        sub = df[df["duplicates"] == dup]
+        ax.scatter(
+            sub["logprob_correct_standard"],
+            sub["logprob_correct_perturbed"],
+            c="tab:blue", alpha=0.3, s=8, edgecolors="none",
+        )
+        ax.plot([lo - pad, hi + pad], [lo - pad, hi + pad], "k--", alpha=0.4, linewidth=0.8)
+        ax.set_xlim(lo - pad, hi + pad)
+        ax.set_ylim(lo - pad, hi + pad)
+        ax.set_title(f"dup={dup}  (n={len(sub)})")
+        ax.set_aspect("equal")
+
+    # Axis labels on edge subplots only
+    for ax in axes[-1]:
+        ax.set_xlabel("Standard log-prob (correct)")
+    for ax in axes[:, 0]:
+        ax.set_ylabel("Perturbed log-prob (correct)")
+
+    fig.suptitle("Standard vs Perturbed Log-Prob of Correct Answer (Infill) by Duplication Level", fontsize=12)
+    fig.tight_layout()
+    out = FIGURES_DIR / "logprob_scatter_by_duplication.png"
+    fig.savefig(out, dpi=150)
+    print(f"Saved to {out}")
+    plt.close(fig)
+
+
 if __name__ == "__main__":
     plot_accuracy_by_duplicates()
+    plot_logprob_scatter()
