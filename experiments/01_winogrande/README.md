@@ -1,15 +1,22 @@
-# 01_winogrande — Observations
+# Experiment 01: WinoGrande Contamination Signals
 
-*Quick analysis done with Claude. Findings are preliminary and should be verified more carefully.*
+## Research Question
+Can a model developer who intentionally contaminates test set examples predict memorization from model behavior, enabling correction of benchmark scores or estimation of OOD accuracy?
 
 ## Setup
+- **Models:** Hubble 1B/100B standard (clean) vs perturbed (contaminated)
+- **Data:** WinoGrande perturbation datasets (infill + mcq formats), ~8K examples each with known duplication levels {0, 1, 4, 16, 64, 256}
+- **Eval:** Loss-based choice (standard zero-shot WinoGrande eval: score suffix log-prob conditioned on prefix+option)
 
-- Models: `hubble-1b-100b_toks-standard-hf` (standard) vs `hubble-1b-100b_toks-perturbed-hf` (perturbed)
-- Task: WinoGrande (infill format), suffix log-probability evaluation
-- Duplication levels: 0, 1, 4, 16, 64, 256
-- 8,001 infill examples, 8,001 mcq examples
+## Phase A: Per-example inference (`run.py`)
+For every example x both models: compute per-option log-likelihood, accuracy, and confidence. Save to parquet with duplication metadata.
 
-## Key observations
+## Outputs
+- `results/per_example_signals.parquet` — per-example results with duplication labels
+
+## Observations
+
+*Quick analysis done with Claude. Findings are preliminary and should be verified more carefully.*
 
 **We reproduce the Hubble results on WinoGrande.** The perturbed model shows increasing accuracy gains on contaminated infill examples as duplication count rises (dup=0: -4.8pp, dup=4: +3.6pp, dup=16: +15.7pp, dup=64: +24.5pp, dup=256: +31.5pp). Contamination does not transfer to MCQ format — the perturbed model actually performs *worse* across all MCQ duplication levels.
 

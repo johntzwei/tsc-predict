@@ -44,19 +44,7 @@ tests/             # Tests
 
 ## Experiments
 
-Each experiment is a numbered, self-contained script that hardcodes its parameters and calls into `src/`:
-
-```text
-experiments/
-  00_example/
-    run.py              # experiment script (version-controlled)
-    results/            # outputs (gitignored)
-    logs/               # logs (gitignored)
-    figures/            # plots (gitignored)
-  01_baseline/
-    run.py
-  ...
-```
+Each experiment lives in a numbered folder under `experiments/` with its own `README.md` describing the research question, setup, and findings. See [experiments/README.md](experiments/README.md) for an overview of all experiments.
 
 Create new folders for new experiments — don't edit old ones.
 
