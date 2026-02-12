@@ -12,8 +12,10 @@ RESULTS_DIR = Path(__file__).parent / "results"
 RESULTS_DIR.mkdir(exist_ok=True)
 
 MODELS = {
-    "standard": "allegrolab/hubble-1b-100b_toks-standard-hf",
-    "perturbed": "allegrolab/hubble-1b-100b_toks-perturbed-hf",
+    "standard_100b": "allegrolab/hubble-1b-100b_toks-standard-hf",
+    "perturbed_100b": "allegrolab/hubble-1b-100b_toks-perturbed-hf",
+    "standard_500b": "allegrolab/hubble-1b-500b_toks-standard-hf",
+    "perturbed_500b": "allegrolab/hubble-1b-500b_toks-perturbed-hf",
 }
 
 
