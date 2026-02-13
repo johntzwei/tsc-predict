@@ -52,7 +52,6 @@ class Probe(ABC):
         texts: list[str],
         model,
         tokenizer,
-        *,
     ) -> np.ndarray:
         """Return predicted class labels."""
         ...
@@ -63,7 +62,6 @@ class Probe(ABC):
         texts: list[str],
         model,
         tokenizer,
-        *,
     ) -> np.ndarray:
         """Return predicted probabilities, shape (n_samples, n_classes)."""
         ...
