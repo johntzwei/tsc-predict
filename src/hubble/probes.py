@@ -262,6 +262,10 @@ class FinetuneProbe(Probe, ABC):
     def _checkpoint_dir(self) -> str:
         return f"checkpoint_{self.feature_key}"
 
+    @property
+    def _train_key(self) -> str:
+        return f"lr{self.lr}_ep{self.epochs}_bs{self.batch_size}"
+
     def _make_head(self, hidden_size: int) -> nn.Module:
         return nn.Linear(hidden_size, self.num_classes)
 
@@ -313,8 +317,11 @@ class FinetuneProbe(Probe, ABC):
             seed=seed,
             logging_strategy="epoch",
             save_strategy="no",
-            report_to="none",
+            report_to="wandb",
+            run_name=self.feature_key,
         )
+        import os
+        os.environ.setdefault("WANDB_PROJECT", "tsc-predict")
         trainer = Trainer(
             model=wrapper,
             args=training_args,
@@ -376,7 +383,7 @@ class FullFinetuneProbe(FinetuneProbe):
 
     @property
     def feature_key(self) -> str:
-        return f"finetune_full_layer{self.layer}_{self.pool.__name__}"
+        return f"finetune_full_layer{self.layer}_{self.pool.__name__}_{self._train_key}"
 
     def _prepare_model(self, model):
         return copy.deepcopy(model)
@@ -418,7 +425,7 @@ class LoRAFinetuneProbe(FinetuneProbe):
 
     @property
     def feature_key(self) -> str:
-        return f"finetune_lora_r{self.lora_r}_layer{self.layer}_{self.pool.__name__}"
+        return f"finetune_lora_r{self.lora_r}_layer{self.layer}_{self.pool.__name__}_{self._train_key}"
 
     def _prepare_model(self, model):
         from peft import LoraConfig, TaskType, get_peft_model

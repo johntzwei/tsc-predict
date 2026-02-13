@@ -21,8 +21,8 @@ SEED = 42
 
 # Finetuning probes to run (registry names or custom configs)
 PROBE_CONFIGS = [
-    ("final_layer_lora", PROBES["final_layer_lora"]()),
-    ("final_layer_full_finetune", PROBES["final_layer_full_finetune"]()),
+    ("final_layer_lora", PROBES["final_layer_lora"](epochs=10)),
+    ("final_layer_full_finetune", PROBES["final_layer_full_finetune"](epochs=10)),
 ]
 
 
