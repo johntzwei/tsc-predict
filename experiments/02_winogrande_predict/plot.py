@@ -1,11 +1,10 @@
-"""Plot probe results from saved JSON."""
+"""Plot probe accuracy by duplication count for all probes."""
 
-import json
 from pathlib import Path
 
-import numpy as np
 import matplotlib.pyplot as plt
-from sklearn.metrics import ConfusionMatrixDisplay
+import numpy as np
+from sklearn.metrics import accuracy_score, roc_auc_score
 
 RESULTS_DIR = Path(__file__).parent / "results"
 FIGURES_DIR = Path(__file__).parent / "figures"
@@ -13,57 +12,92 @@ FIGURES_DIR.mkdir(exist_ok=True)
 
 
 def main():
-    with open(RESULTS_DIR / "probe_results.json") as f:
-        results = json.load(f)
+    # Discover all probe prediction files
+    pred_files = sorted(RESULTS_DIR.glob("test_predictions_*.npz"))
+    probe_names = [f.stem.removeprefix("test_predictions_") for f in pred_files]
 
-    class_labels = [0, 1, 4, 16, 64, 256]
-    class_names = [str(c) for c in class_labels]
+    if not probe_names:
+        print("No prediction files found. Run run.py first.")
+        return
 
-    # 1. Confusion matrix (counts) — needs saved predictions, load from npz
-    cm_path = RESULTS_DIR / "confusion_matrix.npy"
-    if cm_path.exists():
-        cm = np.load(cm_path)
+    # Compute per-dup-count accuracy for each probe
+    # Use first file to get the dup count categories
+    first = np.load(pred_files[0])
+    unique_dups = sorted(np.unique(first["dup_counts"]))
+    dup_labels = [str(d) for d in unique_dups]
 
-        fig, ax = plt.subplots(figsize=(8, 6))
-        ConfusionMatrixDisplay(cm, display_labels=class_names).plot(ax=ax, cmap="Blues", values_format="d")
-        ax.set_title("Predicting Duplication Count from Hidden States")
-        ax.set_xlabel("Predicted duplication count")
-        ax.set_ylabel("True duplication count")
-        fig.tight_layout()
-        fig.savefig(FIGURES_DIR / "confusion_matrix.png", dpi=150)
-        plt.close(fig)
+    # Sample counts (same across probes since split is deterministic)
+    sample_counts = [int((first["dup_counts"] == d).sum()) for d in unique_dups]
 
-        # 2. Normalized confusion matrix
-        cm_norm = cm.astype(float) / cm.sum(axis=1, keepdims=True)
-        fig, ax = plt.subplots(figsize=(8, 6))
-        ConfusionMatrixDisplay(cm_norm, display_labels=class_names).plot(ax=ax, cmap="Blues", values_format=".2f")
-        ax.set_title("Normalized Confusion Matrix (row-normalized)")
-        ax.set_xlabel("Predicted duplication count")
-        ax.set_ylabel("True duplication count")
-        fig.tight_layout()
-        fig.savefig(FIGURES_DIR / "confusion_matrix_normalized.png", dpi=150)
-        plt.close(fig)
+    probe_accs = {}
+    for name, path in zip(probe_names, pred_files):
+        data = np.load(path)
+        y_test, y_pred, dups = data["y_test"], data["y_pred"], data["dup_counts"]
+        probe_accs[name] = [
+            accuracy_score(y_test[dups == d], y_pred[dups == d]) for d in unique_dups
+        ]
 
-    # 3. Per-class accuracy bar chart
-    per_class_acc = [results[f"acc_class_{c}"] for c in class_labels]
-    n_per_class = [results.get(f"n_class_{c}", 0) for c in class_labels]
+    # Grouped bar chart
+    n_probes = len(probe_names)
+    n_dups = len(unique_dups)
+    x = np.arange(n_dups)
+    width = 0.8 / n_probes
 
-    fig, ax = plt.subplots(figsize=(8, 5))
-    bars = ax.bar(class_names, per_class_acc, color="steelblue", edgecolor="black")
-    ax.axhline(1 / len(class_labels), color="gray", linestyle="--", alpha=0.5, label="Random baseline")
-    ax.set_xlabel("True duplication count")
-    ax.set_ylabel("Accuracy")
-    ax.set_title("Per-Class Probe Accuracy")
+    fig, ax = plt.subplots(figsize=(10, 5))
+    for i, name in enumerate(probe_names):
+        offset = (i - (n_probes - 1) / 2) * width
+        ax.bar(x + offset, probe_accs[name], width, label=name)
+
+    ax.axhline(0.5, color="gray", linestyle="--", linewidth=0.8)
+    ax.set_xlabel("Duplication count")
+    ax.set_ylabel("Accuracy (predicting dup > 0)")
     ax.set_ylim(0, 1)
-    ax.legend()
-    for bar, c, n in zip(bars, class_labels, n_per_class):
-        if n > 0:
-            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.02, f"n={n}", ha="center", fontsize=9)
+    ax.set_xticks(x)
+    ax.set_xticklabels([f"{d}\n(n={n})" for d, n in zip(dup_labels, sample_counts)])
+    ax.set_title("Probe accuracy by duplication count")
+    ax.legend(fontsize=8)
     fig.tight_layout()
-    fig.savefig(FIGURES_DIR / "per_class_accuracy.png", dpi=150)
-    plt.close(fig)
+    fig.savefig(FIGURES_DIR / "accuracy_by_dup_count.png", dpi=150)
+    print(f"Figure saved to {FIGURES_DIR / 'accuracy_by_dup_count.png'}")
 
-    print(f"Figures saved to {FIGURES_DIR}")
+    # --- AUC-ROC by dup count ---
+    # For each dup count d > 0, compute AUC-ROC of clean (dup=0) vs dup=d
+    contaminated_dups = [d for d in unique_dups if d > 0]
+    clean_idx_first = first["dup_counts"] == 0
+
+    probe_aucs = {}
+    for name, path in zip(probe_names, pred_files):
+        data = np.load(path)
+        y_prob, dups = data["y_prob"], data["dup_counts"]
+        aucs = []
+        for d in contaminated_dups:
+            mask = (dups == 0) | (dups == d)
+            y_binary = (dups[mask] > 0).astype(int)
+            aucs.append(roc_auc_score(y_binary, y_prob[mask]))
+        probe_aucs[name] = aucs
+
+    n_cats = len(contaminated_dups)
+    x2 = np.arange(n_cats)
+    contam_counts = [int((first["dup_counts"] == d).sum()) for d in contaminated_dups]
+    clean_n = int(clean_idx_first.sum())
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    for i, name in enumerate(probe_names):
+        offset = (i - (n_probes - 1) / 2) * width
+        ax.bar(x2 + offset, probe_aucs[name], width, label=name)
+
+    ax.axhline(0.5, color="gray", linestyle="--", linewidth=0.8)
+    ax.set_xlabel("Duplication count")
+    ax.set_ylabel("AUC-ROC (clean vs dup=d)")
+    ax.set_ylim(0, 1)
+    ax.set_xticks(x2)
+    ax.set_xticklabels([f"{d}\n(n={n})" for d, n in zip(
+        [str(d) for d in contaminated_dups], contam_counts)])
+    ax.set_title(f"AUC-ROC: clean (n={clean_n}) vs each duplication level")
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    fig.savefig(FIGURES_DIR / "auc_roc_by_dup_count.png", dpi=150)
+    print(f"Figure saved to {FIGURES_DIR / 'auc_roc_by_dup_count.png'}")
 
 
 if __name__ == "__main__":

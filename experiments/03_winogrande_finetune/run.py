@@ -10,7 +10,7 @@ from sklearn.metrics import accuracy_score, classification_report
 from sklearn.model_selection import StratifiedShuffleSplit
 
 from hubble.eval import load_model
-from hubble.probes import FinetuneProbe, get_probe
+from hubble.probes import FinetuneProbe, PROBES
 
 RESULTS_DIR = Path(__file__).parent / "results"
 RESULTS_DIR.mkdir(exist_ok=True)
@@ -21,8 +21,8 @@ SEED = 42
 
 # Finetuning probes to run (registry names or custom configs)
 PROBE_CONFIGS = [
-    ("final_layer_lora", get_probe("final_layer_lora")),
-    ("final_layer_full_finetune", get_probe("final_layer_full_finetune")),
+    ("final_layer_lora", PROBES["final_layer_lora"]()),
+    ("final_layer_full_finetune", PROBES["final_layer_full_finetune"]()),
 ]
 
 
@@ -50,7 +50,7 @@ def main():
     all_results = {}
     for name, probe in PROBE_CONFIGS:
         print(f"\n{'='*60}")
-        print(f"Probe: {name} (strategy={probe.strategy})")
+        print(f"Probe: {name}")
 
         probe.fit(texts_train, y_train, model, tokenizer, cache_dir=RESULTS_DIR, seed=SEED)
 
