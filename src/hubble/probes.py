@@ -15,34 +15,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 from sklearn.linear_model import LogisticRegressionCV
-from tqdm import tqdm
-
-
-# --- Shared utilities ---
-
-
-def pool_hidden_states(
-    hidden: torch.Tensor, mask: torch.Tensor, method: str
-) -> torch.Tensor:
-    """Pool hidden states using the given method.
-
-    Args:
-        hidden: (batch, seq_len, hidden_dim)
-        mask: (batch, seq_len) attention mask
-        method: "mean" or "last"
-
-    Returns:
-        (batch, hidden_dim) pooled representations
-    """
-    if method == "mean":
-        mask_expanded = mask.unsqueeze(-1).float()
-        return (hidden * mask_expanded).sum(dim=1) / mask_expanded.sum(dim=1)
-    elif method == "last":
-        seq_lengths = mask.sum(dim=1) - 1
-        return hidden[torch.arange(hidden.size(0)), seq_lengths]
-    else:
-        raise ValueError(f"Unknown pool method: {method}")
-
 
 # --- Base class ---
 
@@ -69,7 +41,6 @@ class Probe(ABC):
         model,
         tokenizer,
         *,
-        cache_dir: Path,
         seed: int = 42,
     ) -> None:
         """Train the probe."""
@@ -82,7 +53,6 @@ class Probe(ABC):
         model,
         tokenizer,
         *,
-        cache_dir: Path,
     ) -> np.ndarray:
         """Return predicted class labels."""
         ...
@@ -94,7 +64,6 @@ class Probe(ABC):
         model,
         tokenizer,
         *,
-        cache_dir: Path,
     ) -> np.ndarray:
         """Return predicted probabilities, shape (n_samples, n_classes)."""
         ...
@@ -106,21 +75,28 @@ class Probe(ABC):
 class HiddenStateProbe(Probe):
     """Probe that extracts pooled hidden states from a specific layer.
 
-    Subclasses set `layer`, `pool`, and implement `make_classifier`.
+    Subclasses set `layer` and `pool`.
     Feature extraction results are cached as .npz files.
     """
 
     layer: int = -1
-    pool: str = "mean"
+    cache_path: Path | None = None
+
+    @staticmethod
+    def mean(hidden: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        mask_expanded = mask.unsqueeze(-1).float()
+        return (hidden * mask_expanded).sum(dim=1) / mask_expanded.sum(dim=1)
+
+    @staticmethod
+    def last(hidden: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        seq_lengths = mask.sum(dim=1) - 1
+        return hidden[torch.arange(hidden.size(0)), seq_lengths]
+
+    pool = mean
 
     @property
     def feature_key(self) -> str:
-        return f"layer{self.layer}_pool{self.pool}"
-
-    @abstractmethod
-    def make_classifier(self, seed: int = 42):
-        """Return a fresh sklearn estimator."""
-        ...
+        return f"layer{self.layer}_pool{self.pool.__name__}"
 
     def extract_features(
         self,
@@ -129,19 +105,32 @@ class HiddenStateProbe(Probe):
         texts: list[str],
         batch_size: int = 32,
         show_progress: bool = True,
+        cache_path: Path | None = None,
     ) -> np.ndarray:
-        """Extract pooled hidden state features for all texts."""
+        """Extract pooled hidden state features for all texts.
+
+        If cache_path is provided, loads from cache if it exists,
+        otherwise extracts and saves to cache.
+        """
+        if cache_path is not None:
+            cache_path = Path(cache_path)
+            if cache_path.exists():
+                print(f"[{self.feature_key}] Loading cached hidden states")
+                return np.load(cache_path)["hidden_states"]
+
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
 
+        print(f"[{self.feature_key}] Extracting features...")
         results = []
         n_batches = (len(texts) + batch_size - 1) // batch_size
         iterator = range(0, len(texts), batch_size)
         if show_progress:
-            iterator = tqdm(iterator, total=n_batches, desc="Extracting hidden states")
+            iterator = tqdm(iterator, total=n_batches,
+                            desc="Extracting hidden states")
 
         for start in iterator:
-            batch_texts = texts[start : start + batch_size]
+            batch_texts = texts[start: start + batch_size]
             inputs = tokenizer(
                 batch_texts,
                 padding=True,
@@ -155,91 +144,121 @@ class HiddenStateProbe(Probe):
 
             hidden = outputs.hidden_states[self.layer]
             mask = inputs["attention_mask"]
-            pooled = pool_hidden_states(hidden, mask, self.pool)
+            pooled = self.pool(hidden, mask)
             results.append(pooled.cpu().float().numpy())
 
-        return np.concatenate(results, axis=0)
-
-    def _get_or_extract_features(
-        self,
-        texts: list[str],
-        model,
-        tokenizer,
-        cache_dir: Path,
-        batch_size: int = 32,
-    ) -> np.ndarray:
-        """Load cached features or extract them."""
-        cache_path = cache_dir / f"hidden_states_{self.feature_key}.npz"
-        if cache_path.exists():
-            return np.load(cache_path)["hidden_states"]
-        if model is None:
-            raise RuntimeError(
-                f"Features not cached at {cache_path} and no model provided"
-            )
-        X = self.extract_features(model, tokenizer, texts, batch_size=batch_size)
-        np.savez(cache_path, hidden_states=X)
+        X = np.concatenate(results, axis=0)
+        if cache_path is not None:
+            np.savez(cache_path, hidden_states=X)
+            print(f"[{self.feature_key}] Cached (shape={X.shape})")
         return X
 
+    def _cache_path(self, cache_dir: Path) -> Path:
+        return cache_dir / f"hidden_states_{self.feature_key}.npz"
+
     def fit(self, texts, labels, model, tokenizer, *, cache_dir, seed=42):
-        X = self._get_or_extract_features(texts, model, tokenizer, cache_dir)
-        self._clf = self.make_classifier(seed=seed)
+        X = self.extract_features(
+            model, tokenizer, texts, cache_path=self._cache_path(cache_dir))
+        self._clf = LogisticRegressionCV(
+            Cs=10, cv=5, solver="lbfgs", max_iter=1000,
+            scoring="accuracy", random_state=seed, n_jobs=-1,
+        )
         self._clf.fit(X, labels)
 
     def predict(self, texts, model, tokenizer, *, cache_dir):
-        X = self._get_or_extract_features(texts, model, tokenizer, cache_dir)
+        X = self.extract_features(
+            model, tokenizer, texts, cache_path=self._cache_path(cache_dir))
         return self._clf.predict(X)
 
     def predict_proba(self, texts, model, tokenizer, *, cache_dir):
-        X = self._get_or_extract_features(texts, model, tokenizer, cache_dir)
+        X = self.extract_features(
+            model, tokenizer, texts, cache_path=self._cache_path(cache_dir))
         return self._clf.predict_proba(X)
+
+
+class FinalLayerLinear(HiddenStateProbe):
+    """Last hidden layer, mean pool, logistic regression."""
+
+    layer = -1
+    pool = HiddenStateProbe.mean
+
+
+class FinalLayerLastTokenLinear(HiddenStateProbe):
+    """Last hidden layer, last-token pool, logistic regression."""
+
+    layer = -1
+    pool = HiddenStateProbe.last
 
 
 # --- Finetuning probes (end-to-end with classification head) ---
 
 
-class FinetuneProbe(Probe):
-    """Probe that attaches a classification head and trains end-to-end.
+class _ProbeModel(nn.Module):
+    """Wraps base model + classification head so HF Trainer can train them jointly."""
 
-    Supports full finetuning or LoRA. Caches model checkpoints.
-    The base model is NOT modified in-place: LoRA uses merge_and_unload
-    for teardown, and full finetuning works on a deepcopy.
+    def __init__(self, model, head, layer, pool_fn):
+        super().__init__()
+        self.model = model
+        self.head = head
+        self.layer = layer
+        self.pool_fn = pool_fn
 
-    NOTE: full finetuning deepcopies the model, roughly doubling GPU memory.
-    For a 1B model in fp32 this is ~4GB extra; for larger models consider LoRA.
+    @property
+    def config(self):
+        return self.model.config
+
+    def forward(self, input_ids, attention_mask, labels=None, **kwargs):
+        outputs = self.model(
+            input_ids=input_ids, attention_mask=attention_mask,
+            output_hidden_states=True,
+        )
+        pooled = self.pool_fn(outputs.hidden_states[self.layer], attention_mask)
+        logits = self.head(pooled)
+        loss = None
+        if labels is not None:
+            loss = nn.functional.cross_entropy(logits, labels)
+        return {"loss": loss, "logits": logits}
+
+
+class _ProbeDataset(torch.utils.data.Dataset):
+    def __init__(self, encodings, labels):
+        self.encodings = encodings
+        self.labels = labels
+
+    def __len__(self):
+        return len(self.labels)
+
+    def __getitem__(self, idx):
+        item = {k: self.encodings[k][idx] for k in self.encodings.keys()}
+        item["labels"] = int(self.labels[idx])
+        return item
+
+
+class FinetuneProbe(Probe, ABC):
+    """Base for probes that attach a classification head and train end-to-end.
+
+    Subclasses implement _prepare_model, _save_checkpoint, _load_checkpoint.
+    Training uses HuggingFace Trainer.
     """
 
     def __init__(
         self,
-        strategy: str = "lora",
         layer: int = -1,
-        pool: str = "mean",
+        pool=HiddenStateProbe.mean,
         lr: float = 1e-4,
         epochs: int = 3,
         batch_size: int = 16,
         num_classes: int = 2,
-        lora_r: int = 8,
-        lora_alpha: int = 16,
-        lora_target_modules: list[str] | None = None,
     ):
-        self.strategy = strategy
         self.layer = layer
         self.pool = pool
         self.lr = lr
         self.epochs = epochs
         self.batch_size = batch_size
         self.num_classes = num_classes
-        self.lora_r = lora_r
-        self.lora_alpha = lora_alpha
-        self.lora_target_modules = lora_target_modules or ["q_proj", "v_proj"]
 
         self._head: nn.Module | None = None
         self._inference_model = None
-
-    @property
-    def feature_key(self) -> str:
-        if self.strategy == "lora":
-            return f"finetune_lora_r{self.lora_r}_layer{self.layer}_{self.pool}"
-        return f"finetune_full_layer{self.layer}_{self.pool}"
 
     @property
     def _checkpoint_dir(self) -> str:
@@ -248,63 +267,23 @@ class FinetuneProbe(Probe):
     def _make_head(self, hidden_size: int) -> nn.Module:
         return nn.Linear(hidden_size, self.num_classes)
 
+    @abstractmethod
     def _prepare_model(self, model):
-        """Prepare model for training. Never modifies the original in-place.
+        """Return a trainable copy/wrapper of the model."""
+        ...
 
-        Returns the model to train (PEFT-wrapped or deepcopy).
-        """
-        if self.strategy == "lora":
-            from peft import LoraConfig, TaskType, get_peft_model
-
-            lora_config = LoraConfig(
-                task_type=TaskType.FEATURE_EXTRACTION,
-                r=self.lora_r,
-                lora_alpha=self.lora_alpha,
-                target_modules=self.lora_target_modules,
-                lora_dropout=0.05,
-            )
-            return get_peft_model(model, lora_config)
-        else:
-            return copy.deepcopy(model)
-
-    def _teardown_model(self, train_model):
-        """Clean up after training."""
-        if self.strategy == "lora":
-            # merge_and_unload restores the base model
-            train_model.merge_and_unload()
-        del train_model
-        torch.cuda.empty_cache()
-
+    @abstractmethod
     def _save_checkpoint(self, path: Path, train_model, head: nn.Module):
-        path.mkdir(parents=True, exist_ok=True)
-        if self.strategy == "lora":
-            train_model.save_pretrained(path / "lora_adapter")
-        else:
-            torch.save(train_model.state_dict(), path / "model.pt")
-        torch.save(head.state_dict(), path / "head.pt")
+        ...
 
+    @abstractmethod
     def _load_checkpoint(self, path: Path, model):
-        """Load checkpoint into self._inference_model and self._head."""
-        hidden_size = model.config.hidden_size
-        self._head = self._make_head(hidden_size).to(model.device)
-        self._head.load_state_dict(
-            torch.load(path / "head.pt", map_location=model.device, weights_only=True)
-        )
-        if self.strategy == "lora":
-            from peft import PeftModel
-
-            self._inference_model = PeftModel.from_pretrained(
-                model, path / "lora_adapter"
-            )
-        else:
-            model.load_state_dict(
-                torch.load(
-                    path / "model.pt", map_location=model.device, weights_only=True
-                )
-            )
-            self._inference_model = model
+        """Populate self._inference_model and self._head from a checkpoint."""
+        ...
 
     def fit(self, texts, labels, model, tokenizer, *, cache_dir, seed=42):
+        from transformers import Trainer, TrainingArguments, DataCollatorWithPadding
+
         checkpoint_path = cache_dir / self._checkpoint_dir
         if checkpoint_path.exists():
             print(f"[{self.feature_key}] Checkpoint exists, skipping training")
@@ -318,67 +297,40 @@ class FinetuneProbe(Probe):
         train_model = self._prepare_model(model)
         hidden_size = train_model.config.hidden_size
         head = self._make_head(hidden_size).to(model.device)
+        wrapper = _ProbeModel(train_model, head, self.layer, self.pool)
+
+        encodings = tokenizer(list(texts), truncation=True, max_length=512)
+        dataset = _ProbeDataset(encodings, labels)
 
         # Higher LR for the randomly-initialized head
-        optimizer = torch.optim.AdamW(
-            [
-                {"params": train_model.parameters(), "lr": self.lr},
-                {"params": head.parameters(), "lr": self.lr * 10},
-            ]
+        optimizer = torch.optim.AdamW([
+            {"params": train_model.parameters(), "lr": self.lr},
+            {"params": head.parameters(), "lr": self.lr * 10},
+        ])
+
+        training_args = TrainingArguments(
+            output_dir=str(checkpoint_path / "_trainer"),
+            num_train_epochs=self.epochs,
+            per_device_train_batch_size=self.batch_size,
+            seed=seed,
+            logging_strategy="epoch",
+            save_strategy="no",
+            report_to="none",
         )
-        loss_fn = nn.CrossEntropyLoss()
-
-        indices = np.arange(len(texts))
-        for epoch in range(self.epochs):
-            np.random.seed(seed + epoch)
-            np.random.shuffle(indices)
-            train_model.train()
-            head.train()
-            epoch_loss = 0.0
-            n_batches = 0
-
-            for start in tqdm(
-                range(0, len(texts), self.batch_size),
-                desc=f"Epoch {epoch + 1}/{self.epochs}",
-            ):
-                batch_idx = indices[start : start + self.batch_size]
-                batch_texts = [texts[i] for i in batch_idx]
-                batch_labels = torch.tensor(
-                    labels[batch_idx], dtype=torch.long, device=model.device
-                )
-
-                inputs = tokenizer(
-                    batch_texts,
-                    padding=True,
-                    truncation=True,
-                    max_length=512,
-                    return_tensors="pt",
-                ).to(model.device)
-
-                outputs = train_model(**inputs, output_hidden_states=True)
-                pooled = pool_hidden_states(
-                    outputs.hidden_states[self.layer],
-                    inputs["attention_mask"],
-                    self.pool,
-                )
-                logits = head(pooled)
-                loss = loss_fn(logits, batch_labels)
-
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-
-                epoch_loss += loss.item()
-                n_batches += 1
-
-            print(f"  Epoch {epoch + 1}/{self.epochs}, avg loss={epoch_loss / n_batches:.4f}")
+        trainer = Trainer(
+            model=wrapper,
+            args=training_args,
+            train_dataset=dataset,
+            data_collator=DataCollatorWithPadding(tokenizer),
+            optimizers=(optimizer, None),
+        )
+        trainer.train()
 
         self._save_checkpoint(checkpoint_path, train_model, head)
         self._head = head
         self._inference_model = train_model
 
-    def _forward_batched(self, texts, model, tokenizer, cache_dir):
-        """Run batched inference, returning probability arrays."""
+    def predict_proba(self, texts, model, tokenizer, *, cache_dir):
         checkpoint_path = cache_dir / self._checkpoint_dir
         if self._inference_model is None:
             self._load_checkpoint(checkpoint_path, model)
@@ -392,7 +344,7 @@ class FinetuneProbe(Probe):
 
         with torch.no_grad():
             for start in range(0, len(texts), self.batch_size):
-                batch_texts = texts[start : start + self.batch_size]
+                batch_texts = texts[start: start + self.batch_size]
                 inputs = tokenizer(
                     batch_texts,
                     padding=True,
@@ -401,11 +353,11 @@ class FinetuneProbe(Probe):
                     return_tensors="pt",
                 ).to(model.device)
 
-                outputs = self._inference_model(**inputs, output_hidden_states=True)
-                pooled = pool_hidden_states(
+                outputs = self._inference_model(
+                    **inputs, output_hidden_states=True)
+                pooled = self.pool(
                     outputs.hidden_states[self.layer],
                     inputs["attention_mask"],
-                    self.pool,
                 )
                 logits = self._head(pooled)
                 probs = torch.softmax(logits, dim=-1).cpu().numpy()
@@ -414,63 +366,98 @@ class FinetuneProbe(Probe):
         return np.concatenate(all_probs, axis=0)
 
     def predict(self, texts, model, tokenizer, *, cache_dir):
-        proba = self._forward_batched(texts, model, tokenizer, cache_dir)
-        return proba.argmax(axis=1)
-
-    def predict_proba(self, texts, model, tokenizer, *, cache_dir):
-        return self._forward_batched(texts, model, tokenizer, cache_dir)
+        return self.predict_proba(
+            texts, model, tokenizer, cache_dir=cache_dir).argmax(axis=1)
 
 
-# --- Concrete probes ---
+class FullFinetuneProbe(FinetuneProbe):
+    """Full finetuning: deepcopies the model.
 
+    NOTE: roughly doubles GPU memory (e.g. ~4GB extra for a 1B model in fp32).
+    """
 
-class FinalLayerLinear(HiddenStateProbe):
-    """Last hidden layer, mean pool, logistic regression."""
+    @property
+    def feature_key(self) -> str:
+        return f"finetune_full_layer{self.layer}_{self.pool.__name__}"
 
-    layer = -1
-    pool = "mean"
+    def _prepare_model(self, model):
+        return copy.deepcopy(model)
 
-    def make_classifier(self, seed: int = 42):
-        return LogisticRegressionCV(
-            Cs=10, cv=5, solver="lbfgs", max_iter=1000,
-            scoring="accuracy", random_state=seed, n_jobs=-1,
+    def _save_checkpoint(self, path: Path, train_model, head: nn.Module):
+        path.mkdir(parents=True, exist_ok=True)
+        torch.save(train_model.state_dict(), path / "model.pt")
+        torch.save(head.state_dict(), path / "head.pt")
+
+    def _load_checkpoint(self, path: Path, model):
+        hidden_size = model.config.hidden_size
+        self._head = self._make_head(hidden_size).to(model.device)
+        self._head.load_state_dict(
+            torch.load(path / "head.pt", map_location=model.device,
+                       weights_only=True)
         )
+        model.load_state_dict(
+            torch.load(
+                path / "model.pt", map_location=model.device, weights_only=True
+            )
+        )
+        self._inference_model = model
 
 
-class FinalLayerLastTokenLinear(HiddenStateProbe):
-    """Last hidden layer, last-token pool, logistic regression."""
+class LoRAFinetuneProbe(FinetuneProbe):
+    """LoRA finetuning via PEFT."""
 
-    layer = -1
-    pool = "last"
+    def __init__(
+        self,
+        lora_r: int = 8,
+        lora_alpha: int = 16,
+        lora_target_modules: list[str] | None = None,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.lora_r = lora_r
+        self.lora_alpha = lora_alpha
+        self.lora_target_modules = lora_target_modules or ["q_proj", "v_proj"]
 
-    def make_classifier(self, seed: int = 42):
-        return LogisticRegressionCV(
-            Cs=10, cv=5, solver="lbfgs", max_iter=1000,
-            scoring="accuracy", random_state=seed, n_jobs=-1,
+    @property
+    def feature_key(self) -> str:
+        return f"finetune_lora_r{self.lora_r}_layer{self.layer}_{self.pool.__name__}"
+
+    def _prepare_model(self, model):
+        from peft import LoraConfig, TaskType, get_peft_model
+
+        lora_config = LoraConfig(
+            task_type=TaskType.FEATURE_EXTRACTION,
+            r=self.lora_r,
+            lora_alpha=self.lora_alpha,
+            target_modules=self.lora_target_modules,
+            lora_dropout=0.05,
+        )
+        return get_peft_model(model, lora_config)
+
+    def _save_checkpoint(self, path: Path, train_model, head: nn.Module):
+        path.mkdir(parents=True, exist_ok=True)
+        train_model.save_pretrained(path / "lora_adapter")
+        torch.save(head.state_dict(), path / "head.pt")
+
+    def _load_checkpoint(self, path: Path, model):
+        from peft import PeftModel
+
+        hidden_size = model.config.hidden_size
+        self._head = self._make_head(hidden_size).to(model.device)
+        self._head.load_state_dict(
+            torch.load(path / "head.pt", map_location=model.device,
+                       weights_only=True)
+        )
+        self._inference_model = PeftModel.from_pretrained(
+            model, path / "lora_adapter"
         )
 
 
 # --- Registry ---
 
-# Values are either probe classes (instantiated with no args) or callables
-# that return a Probe instance.
 PROBES: dict[str, type[Probe] | callable] = {
     "final_layer_linear": FinalLayerLinear,
     "final_layer_last_token_linear": FinalLayerLastTokenLinear,
-    "final_layer_lora": lambda: FinetuneProbe(strategy="lora"),
-    "final_layer_full_finetune": lambda: FinetuneProbe(strategy="full"),
+    "final_layer_lora": LoRAFinetuneProbe,
+    "final_layer_full_finetune": FullFinetuneProbe,
 }
-
-
-def get_probe(name: str) -> Probe:
-    """Instantiate a probe by name."""
-    if name not in PROBES:
-        raise ValueError(f"Unknown probe '{name}'. Available: {list_probes()}")
-    entry = PROBES[name]
-    if isinstance(entry, type):
-        return entry()
-    return entry()  # callable (lambda)
-
-
-def list_probes() -> list[str]:
-    return list(PROBES.keys())
