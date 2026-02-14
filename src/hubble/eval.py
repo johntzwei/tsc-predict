@@ -1,9 +1,12 @@
-"""Inference utilities for evaluating Hubble models on WinoGrande-style tasks."""
+"""Inference utilities for evaluating Hubble models on benchmark tasks."""
 
+import numpy as np
 import torch
 import pandas as pd
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from tqdm import tqdm
+
+MMLU_LETTERS = ["A", "B", "C", "D"]
 
 
 def load_model(model_id: str, device: str = "cuda", dtype: torch.dtype | None = None):
@@ -101,13 +104,83 @@ def evaluate_winogrande_df(model, tokenizer, df: pd.DataFrame, model_label: str)
     df[f"acc_{model_label}"] = (pred.values == df["answer"].values).astype(int)
 
     # Confidence: softmax of the two log-probs for the correct answer
-    import numpy as np
     lp1_arr = np.array(lp1s)
     lp2_arr = np.array(lp2s)
     # Probability of option 1
     p1 = np.exp(lp1_arr) / (np.exp(lp1_arr) + np.exp(lp2_arr))
     p2 = 1 - p1
     correct_confidence = np.where(df["answer"].values == 1, p1, p2)
+    df[f"confidence_{model_label}"] = correct_confidence
+
+    return df
+
+
+# ---------------------------------------------------------------------------
+# MMLU evaluation
+# ---------------------------------------------------------------------------
+
+def format_mmlu_prompt(question: str, choices: list[str], subject: str) -> str:
+    """Format an MMLU question as the standard lm-eval-harness prompt.
+
+    Returns prompt ending with "Answer:" (no trailing space).
+    """
+    subject_str = subject.replace("_", " ")
+    options = "\n".join(
+        f"{letter}. {choice}" for letter, choice in zip(MMLU_LETTERS, choices)
+    )
+    return (
+        f"The following are multiple choice questions (with answers) about {subject_str}.\n\n"
+        f"{question.strip()}\n{options}\nAnswer:"
+    )
+
+
+def evaluate_mmlu_example(
+    model, tokenizer, question: str, choices: list[str], subject: str
+) -> dict:
+    """Evaluate a single MMLU example via single-letter logprob scoring.
+
+    Matches lm-eval-harness standard `mmlu` task: score " A", " B", " C", " D"
+    as continuations of the formatted prompt.
+
+    Returns dict with logprob_A, logprob_B, logprob_C, logprob_D.
+    """
+    prompt = format_mmlu_prompt(question, choices, subject)
+    return {
+        f"logprob_{letter}": compute_suffix_logprob(model, tokenizer, prompt, f" {letter}")
+        for letter in MMLU_LETTERS
+    }
+
+
+def evaluate_mmlu_df(
+    model, tokenizer, df: pd.DataFrame, model_label: str
+) -> pd.DataFrame:
+    """Evaluate all MMLU examples in a DataFrame.
+
+    Adds columns: logprob_{A,B,C,D}_{label}, acc_{label}, confidence_{label}.
+    """
+    lps = {letter: [] for letter in MMLU_LETTERS}
+    for _, row in tqdm(df.iterrows(), total=len(df), desc=f"Eval {model_label}"):
+        result = evaluate_mmlu_example(
+            model, tokenizer, row["question"], row["choices"], row["subject"]
+        )
+        for letter in MMLU_LETTERS:
+            lps[letter].append(result[f"logprob_{letter}"])
+
+    df = df.copy()
+    lp_arr = np.column_stack([lps[l] for l in MMLU_LETTERS])  # (n, 4)
+    for i, letter in enumerate(MMLU_LETTERS):
+        df[f"logprob_{letter}_{model_label}"] = lp_arr[:, i]
+
+    # Predicted answer: argmax over 4 logprobs (0-indexed)
+    pred = np.argmax(lp_arr, axis=1)
+    df[f"acc_{model_label}"] = (pred == df["answer"].values).astype(int)
+
+    # Confidence: softmax for the correct answer
+    # Use log-sum-exp trick for numerical stability
+    lp_max = lp_arr.max(axis=1, keepdims=True)
+    exp_shifted = np.exp(lp_arr - lp_max)
+    probs = exp_shifted / exp_shifted.sum(axis=1, keepdims=True)
+    correct_confidence = probs[np.arange(len(df)), df["answer"].values]
     df[f"confidence_{model_label}"] = correct_confidence
 
     return df
