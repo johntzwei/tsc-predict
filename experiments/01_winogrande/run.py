@@ -1,4 +1,12 @@
-"""Compute per-example WinoGrande accuracies on Hubble 1B/100B standard and perturbed models."""
+"""Compute per-example WinoGrande accuracies on Hubble 1B and 8B standard and perturbed models.
+
+Supports parallel execution via SLURM array jobs:
+  sbatch --array=0-7 slurm/run_gpu.sbatch experiments/01_winogrande/run.py
+Each task evaluates one model and saves a per-model cache.
+
+Sequential mode evaluates any models without a cached result:
+  uv run python experiments/01_winogrande/run.py
+"""
 
 import os
 from pathlib import Path
@@ -11,64 +19,60 @@ from hubble.eval import load_model, evaluate_winogrande_df
 RESULTS_DIR = Path(__file__).parent / "results"
 RESULTS_DIR.mkdir(exist_ok=True)
 
-MODELS = {
-    "standard_100b": "allegrolab/hubble-1b-100b_toks-standard-hf",
-    "perturbed_100b": "allegrolab/hubble-1b-100b_toks-perturbed-hf",
-    "standard_500b": "allegrolab/hubble-1b-500b_toks-standard-hf",
-    "perturbed_500b": "allegrolab/hubble-1b-500b_toks-perturbed-hf",
-}
+MODELS = [
+    ("1b_standard_100b", "allegrolab/hubble-1b-100b_toks-standard-hf"),
+    ("1b_perturbed_100b", "allegrolab/hubble-1b-100b_toks-perturbed-hf"),
+    ("1b_standard_500b", "allegrolab/hubble-1b-500b_toks-standard-hf"),
+    ("1b_perturbed_500b", "allegrolab/hubble-1b-500b_toks-perturbed-hf"),
+    ("8b_standard_100b", "allegrolab/hubble-8b-100b_toks-standard-hf"),
+    ("8b_perturbed_100b", "allegrolab/hubble-8b-100b_toks-perturbed-hf"),
+    ("8b_standard_500b", "allegrolab/hubble-8b-500b_toks-standard-hf"),
+    ("8b_perturbed_500b", "allegrolab/hubble-8b-500b_toks-perturbed-hf"),
+]
 
 
-def main():
-    # Load perturbation data for both formats
+def load_data():
     print("Loading WinoGrande perturbation data...")
     df_infill = load_winogrande_perturbations("infill")
     df_mcq = load_winogrande_perturbations("mcq")
     df = pd.concat([df_infill, df_mcq], ignore_index=True)
     print(f"Total examples: {len(df)} ({len(df_infill)} infill, {len(df_mcq)} mcq)")
-    print(f"Duplication distribution:\n{df.groupby(['format', 'split'])['duplicates'].value_counts().sort_index()}")
+    return df
 
-    # Evaluate each model sequentially (load one at a time)
-    for label, model_id in MODELS.items():
-        cache_path = RESULTS_DIR / f"eval_{label}.parquet"
-        if cache_path.exists():
-            print(f"Loading cached results for {label} from {cache_path}")
-            cached = pd.read_parquet(cache_path)
-            # Merge cached columns into df
-            new_cols = [c for c in cached.columns if c.endswith(f"_{label}")]
-            for col in new_cols:
-                df[col] = cached[col]
-            continue
 
-        print(f"\nLoading model: {model_id}")
-        model, tokenizer = load_model(model_id)
+def evaluate_single(df, label, model_id):
+    """Evaluate one model and save cache."""
+    cache_path = RESULTS_DIR / f"eval_{label}.parquet"
+    if cache_path.exists():
+        print(f"Cache already exists for {label}, skipping.")
+        return
 
-        print(f"Evaluating {len(df)} examples on {label} model...")
-        df = evaluate_winogrande_df(model, tokenizer, df, label)
+    print(f"Loading model: {model_id}")
+    model, tokenizer = load_model(model_id)
 
-        # Cache per-model results
-        df.to_parquet(cache_path)
-        print(f"Cached {label} results to {cache_path}")
+    print(f"Evaluating {len(df)} examples on {label}...")
+    df = evaluate_winogrande_df(model, tokenizer, df, label)
 
-        # Free GPU memory before loading next model
-        del model, tokenizer
-        import torch
-        torch.cuda.empty_cache()
+    df.to_parquet(cache_path)
+    print(f"Cached {label} results to {cache_path}")
 
-    # Save final combined results
-    out_path = RESULTS_DIR / "per_example_signals.parquet"
-    df.to_parquet(out_path)
-    print(f"\nSaved results to {out_path}")
 
-    # Print summary stats
-    for label in MODELS:
-        for fmt in ["infill", "mcq"]:
-            mask = df["format"] == fmt
-            acc = df.loc[mask, f"acc_{label}"].mean()
-            print(f"{label}/{fmt}: accuracy = {acc:.4f} (n={mask.sum()})")
-            # By duplication level
-            by_dup = df.loc[mask].groupby("duplicates")[f"acc_{label}"].mean()
-            print(f"  By duplication: {by_dup.to_dict()}")
+def main():
+    df = load_data()
+    task_id = os.environ.get("SLURM_ARRAY_TASK_ID")
+
+    if task_id is not None:
+        task_id = int(task_id)
+        label, model_id = MODELS[task_id]
+        print(f"Array task {task_id}: evaluating {label}")
+        evaluate_single(df, label, model_id)
+    else:
+        for label, model_id in MODELS:
+            cache_path = RESULTS_DIR / f"eval_{label}.parquet"
+            if not cache_path.exists():
+                evaluate_single(df, label, model_id)
+                import torch
+                torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":
