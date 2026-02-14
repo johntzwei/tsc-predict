@@ -37,7 +37,7 @@ def _load_data():
     return df
 
 
-def plot_set_accuracy_scatter(n_subsets=500, subset_size=100, seed=42):
+def plot_set_accuracy_scatter(n_subsets=500, subset_size=500, seed=42):
     """Scatter: standard vs perturbed set-level signals on random subsets (dups=0 only)."""
     df = _load_data()
 
@@ -98,7 +98,7 @@ def plot_set_accuracy_scatter(n_subsets=500, subset_size=100, seed=42):
         plt.close(fig)
 
 
-def plot_set_scale_scatter(n_subsets=500, subset_size=100, seed=42):
+def plot_set_scale_scatter(n_subsets=500, subset_size=500, seed=42):
     """Scatter: 100B vs 500B set-level signals, rows = model size, cols = metric."""
     df = _load_data()
 
@@ -157,7 +157,7 @@ def plot_set_scale_scatter(n_subsets=500, subset_size=100, seed=42):
     plt.close(fig)
 
 
-def plot_set_interference_scatter(n_subsets=500, subset_size=100, seed=42):
+def plot_set_interference_scatter(n_subsets=500, subset_size=500, seed=42):
     """Scatter: 1B standard vs 1B interference set-level signals (dups=0 only)."""
     df = pd.read_parquet(EXP05_RESULTS_DIR / "per_example_signals.parquet")
     df = df[df["duplicates"] == 0]
@@ -248,8 +248,76 @@ def print_agreement_table():
         print()
 
 
+def print_set_correlations(n_subsets=500, subset_size=500, seed=42):
+    """Print set-level correlations for all scatter comparisons."""
+    df = _load_data()
+
+    # Also load interference
+    df_full = pd.read_parquet(EXP05_RESULTS_DIR / "per_example_signals.parquet")
+    df_full = df_full[df_full["duplicates"] == 0]
+    for model in ["1b_standard_100b", "1b_interference_100b"]:
+        col = f"logprob_A_{model}"
+        if col in df_full.columns:
+            df_full[f"lp_correct_{model}"] = _logprob_correct(df_full, model)
+
+    metrics = [
+        ("acc", "Accuracy", "mean"),
+        ("lp_correct", "logprob(correct)", "sum"),
+    ]
+
+    def _corr(data, col_a, col_b, agg):
+        rng = np.random.default_rng(seed)
+        a_vals, b_vals = [], []
+        for _ in range(n_subsets):
+            idx = rng.choice(len(data), size=subset_size, replace=False)
+            batch = data.iloc[idx]
+            fn_a = batch[col_a].mean if agg == "mean" else batch[col_a].sum
+            fn_b = batch[col_b].mean if agg == "mean" else batch[col_b].sum
+            a_vals.append(fn_a())
+            b_vals.append(fn_b())
+        return np.corrcoef(a_vals, b_vals)[0, 1]
+
+    print(f"\nSet-level correlations (n={subset_size}, {n_subsets} subsets)")
+    print("=" * 70)
+
+    # Standard vs Perturbed
+    print("\nStandard vs Perturbed:")
+    for prefix, label, agg in metrics:
+        for size in MODEL_SIZES:
+            for scale in TOKEN_SCALES:
+                std_col = f"{prefix}_{size}_standard_{scale}"
+                pert_col = f"{prefix}_{size}_perturbed_{scale}"
+                if std_col not in df.columns:
+                    continue
+                r = _corr(df, std_col, pert_col, agg)
+                print(f"  {size}/{scale} {label:>20s}: r = {r:.3f}")
+
+    # 100B vs 500B
+    print("\n100B vs 500B:")
+    for prefix, label, agg in metrics:
+        for size in MODEL_SIZES:
+            for variant in ["standard", "perturbed"]:
+                col_100b = f"{prefix}_{size}_{variant}_100b"
+                col_500b = f"{prefix}_{size}_{variant}_500b"
+                if col_100b not in df.columns:
+                    continue
+                r = _corr(df, col_100b, col_500b, agg)
+                print(f"  {size}/{variant} {label:>20s}: r = {r:.3f}")
+
+    # Interference
+    print("\nStandard vs Interference (1B/100B):")
+    for prefix, label, agg in metrics:
+        std_col = f"{prefix}_1b_standard_100b"
+        int_col = f"{prefix}_1b_interference_100b"
+        if int_col not in df_full.columns:
+            continue
+        r = _corr(df_full, std_col, int_col, agg)
+        print(f"  {label:>20s}: r = {r:.3f}")
+
+
 if __name__ == "__main__":
     plot_set_accuracy_scatter()
     plot_set_interference_scatter()
     plot_set_scale_scatter()
     print_agreement_table()
+    print_set_correlations()

@@ -28,6 +28,7 @@ MODELS = [
     ("8b_perturbed_100b", "allegrolab/hubble-8b-100b_toks-perturbed-hf"),
     ("8b_standard_500b", "allegrolab/hubble-8b-500b_toks-standard-hf"),
     ("8b_perturbed_500b", "allegrolab/hubble-8b-500b_toks-perturbed-hf"),
+    ("1b_interference_100b", "allegrolab/hubble-1b-100b_toks-interference_testset-hf"),
 ]
 
 

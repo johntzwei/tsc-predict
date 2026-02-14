@@ -9,3 +9,5 @@ Each numbered folder is a self-contained experiment with its own `README.md`, `r
 | 02 | [02_winogrande_predict](02_winogrande_predict/) | Probing hidden states to predict duplication count with linear probes on the perturbed model |
 | 03 | [03_winogrande_finetune](03_winogrande_finetune/) | Finetuning probes (LoRA/full) to predict duplication count |
 | 04 | [04_winogrande_set](04_winogrande_set/) | Set-level sanity check — standard vs perturbed accuracy and logprob(correct) on random subsets of uncontaminated examples |
+| 05 | [05_mmlu](05_mmlu/) | MMLU contamination signals — per-example accuracy across duplication levels; most models at chance except 8B/500B |
+| 06 | [06_mmlu_set](06_mmlu_set/) | MMLU set-level analysis — analogous to exp 04; confirms MMLU is a negative control (no signal except 8B/500B) |

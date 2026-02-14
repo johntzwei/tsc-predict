@@ -20,7 +20,7 @@ MODELS = [
     for size in MODEL_SIZES
     for variant in ["standard", "perturbed"]
     for scale in TOKEN_SCALES
-]
+] + ["1b_interference_100b"]
 
 
 def load_combined():
@@ -148,6 +148,53 @@ def plot_logprob_scatter():
             plt.close(fig)
 
 
+def plot_interference_scatter():
+    """Scatter: 1B standard 100B vs 1B interference 100B log-prob of correct answer, grid by dup level."""
+    df = load_combined()
+
+    for model in ["1b_standard_100b", "1b_interference_100b"]:
+        lp1 = f"logprob_option1_{model}"
+        if lp1 not in df.columns:
+            print(f"Skipping interference scatter ({model} columns not found)")
+            return
+        df[f"logprob_correct_{model}"] = np.where(
+            df["answer"] == 1, df[lp1], df[f"logprob_option2_{model}"],
+        )
+
+    sub = df[df["format"] == "infill"]
+    std_key = "logprob_correct_1b_standard_100b"
+    int_key = "logprob_correct_1b_interference_100b"
+
+    dup_levels = sorted(sub["duplicates"].unique())
+    fig, axes = plt.subplots(2, 3, figsize=(14, 9), sharex=True, sharey=True)
+
+    all_vals = pd.concat([sub[std_key], sub[int_key]])
+    lo, hi = all_vals.quantile(0.001), all_vals.quantile(0.999)
+    pad = (hi - lo) * 0.05
+
+    for ax, dup in zip(axes.flat, dup_levels):
+        s = sub[sub["duplicates"] == dup]
+        ax.scatter(s[std_key], s[int_key], c="tab:green", alpha=0.3, s=8, edgecolors="none")
+        ax.plot([lo - pad, hi + pad], [lo - pad, hi + pad], "k--", alpha=0.4, linewidth=0.8)
+        ax.set_xlim(lo - pad, hi + pad)
+        ax.set_ylim(lo - pad, hi + pad)
+        ax.set_title(f"dup={dup}  (n={len(s)})")
+        ax.set_aspect("equal")
+
+    for ax in axes[-1]:
+        ax.set_xlabel("Standard log-prob (correct)")
+    for ax in axes[:, 0]:
+        ax.set_ylabel("Interference log-prob (correct)")
+
+    fig.suptitle("Standard vs Interference Log-Prob of Correct Answer (Infill, 1B/100B)", fontsize=12)
+    fig.tight_layout()
+    out = FIGURES_DIR / "logprob_scatter_by_duplication_interference.png"
+    fig.savefig(out, dpi=150)
+    print(f"Saved to {out}")
+    plt.close(fig)
+
+
 if __name__ == "__main__":
     plot_accuracy_by_duplicates()
     plot_logprob_scatter()
+    plot_interference_scatter()
